@@ -21,8 +21,7 @@
 
 """
 With a NGC pytorch container
-additional requirements are 
-pip install pycuda
+additional requirements is 
 pip install pynvvideocodec
 
 to run it:
@@ -38,7 +37,6 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torchvision.transforms.functional import resize
 import PyNvVideoCodec as nvc
-import pycuda.driver as cuda
 import torch 
 import numpy as np
 
@@ -46,15 +44,7 @@ batch_size = 4
 sequence_length = 8
 stride = 1
 initial_prefetch_size = 16
-video_directory = "/workspace/playbooks/video/assets/output"
-
-# Initialize CUDA
-cuda.init()
-device = cuda.Device(0)  # Use GPU 0
-cuda_ctx = device.retain_primary_context()
-cuda_ctx.push()
-cuda_stream_nv_dec = cuda.Stream()  # create cuda streams for allocations
-cuda_stream_app = cuda.Stream()  
+video_directory = "/workspace/playbooks/video/UCF-101/UCF-101_proc"
 
 class PyNvCVideoDataset(Dataset):
     def __init__(self, root_dir, transform):
@@ -78,99 +68,57 @@ class PyNvCVideoDataset(Dataset):
                         self.video_paths.append(os.path.join(action_dir, video_file))
                         self.labels.append(label_idx)
 
-        demuxer = nvc.CreateDemuxer(self.video_paths[0])
-        self.decoder = nvc.CreateDecoder(
-            gpuid=0,
-            codec=demuxer.GetNvCodecId(),
-            cudacontext=cuda_ctx.handle,
-            cudastream=cuda_stream_nv_dec.handle,
-            usedevicememory=True,
-            enableasyncallocations=self.enable_async_allocations,
+        # https://docs.nvidia.com/video-technologies/pynvvideocodec/pynvc-api-prog-guide/index.html#simpledecoder-samples
+        self.decoder = nvc.SimpleDecoder(
+            enc_file_path=self.video_paths[0],        # Input filename 
+            gpu_id=0,                                 # Index of GPU, useful for multi-GPU setups 
+            use_device_memory=True,                   # Decoded frames reside in device memory
+            max_width=320,                           # Maximum width of buffer for decoder reuse 
+            max_height=240,                          # Maximum height of buffer for decoder reuse 
+            need_scanned_stream_metadata=False,        # Retrieve stream-level metadata 
+            output_color_type=nvc.OutputColorType.RGB # Decoded frames available as RGB or YUV
         )
                         
     def __len__(self):
         return len(self.video_paths)
-
-    def load_batch(self, path_to_video, batch_indeces):
-        # Initialize CUDA
-        # cuda.init()
-        # device = cuda.Device(0)  # Use GPU 0
-        # cuda_ctx = device.retain_primary_context()
-        # cuda_ctx.push()
-        # cuda_stream_nv_dec = cuda.Stream()  # create cuda streams for allocations
-        # cuda_stream_app = cuda.Stream()
-    
-        # start = cuda.Event()
-        # end = cuda.Event()
-
-        # start.record(stream=cuda_stream_nv_dec)
-        demuxer = nvc.CreateDemuxer(path_to_video)
-        # if self.decoder is None:
-        #     self.decoder = nvc.CreateDecoder(
-        #         gpuid=0,
-        #         codec=demuxer.GetNvCodecId(),
-        #         cudacontext=0, #cuda_ctx.handle,
-        #         cudastream=0, #cuda_stream_nv_dec.handle,
-        #         usedevicememory=True,
-        #         enableasyncallocations=self.enable_async_allocations,
-        #     )
-    
-        frame_count = 0
-        frames = None
-        for packet_index, packet in enumerate(demuxer):
-            #print(packet_index)
-            for frame in self.decoder.Decode(packet):
-                frame_count += 1
-                #print(frame_count)
-                if frame_count in batch_indeces:
-                    if frames is None:
-                        #print(torch.from_dlpack(frame).size())
-                        frames = torch.from_dlpack(frame).unsqueeze(0)
-                        #frames = resize(torch.from_dlpack(frame), [360,320]).unsqueeze(0)
-                        #print(frames.size())
-                    else:
-                        frames = torch.cat((frames, torch.from_dlpack(frame).unsqueeze(0)), dim=0)
-        # decoder.WaitOnCUStream(cuda_stream_app.handle) # not sure if we need this
-        # if frames.size(0) == len(batch_indeces):
-        # end.record()
-        # end.synchronize()
-        # print("time %f" %(start.time_till(end)))
-        # cuda_ctx.pop()
-        return frames
-        
-    
     
     def __getitem__(self, idx):
         video_path = self.video_paths[idx]
         label = self.labels[idx]
-        #print(video_path)
-        
-        # Open a demuxer
-        demuxer = nvc.CreateDemuxer(video_path) 
-        # check video lenght
-        for frame_count, packet in enumerate(demuxer):
-            continue
+
+        # Create decoder with GPU output
+        self.decoder.reconfigure_decoder(video_path)
+        frame_count = len(self.decoder)
         
         # Get frames
-        #print(frame_count)
-        frames_idx = np.floor(np.linspace(1, frame_count, sequence_length))
-        #print(frames_idx)
-        frames = self.load_batch(video_path, frames_idx) # Returns all frames
+        # marginally faster with .tolist()
+        frames_idx = np.linspace(1, frame_count-1, sequence_length, dtype=int).tolist()
+        
+        # # Get multiple frames at regular intervals
+        self.decoder.seek_to_index(0) # make sure to start from frame 0
+        frames = self.decoder.get_batch_frames_by_index(frames_idx)
+
+        # Convert all frames to tensors (all zero-copy)
+        tensors = [torch.from_dlpack(frame) for frame in frames]
+        # Stack into a batch tensor
+        batch = torch.stack(tensors)
+
         # Apply any transformations (e.g., resizing, normalization)
         if self.transform:
-            frames = self.transform(frames)
+            batch = self.transform(batch)
         
-        return frames, label
+        return batch, label
 
   
 
 ucf101_dataset = PyNvCVideoDataset(root_dir=video_directory, transform=None)
-dataloader = DataLoader(ucf101_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+dataloader = DataLoader(ucf101_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
 print(len(ucf101_dataset))
 start = torch.cuda.Event(enable_timing=True)
 end = torch.cuda.Event(enable_timing=True)
 
+print("----- warmup -----")
 for i, data in enumerate(dataloader):
     video = data[0]
     label = data[1]
@@ -178,10 +126,12 @@ for i, data in enumerate(dataloader):
     #print(label.size())
     if i == 9:
         break
+print("--- end warmup ---")
 
+print("-- start timing --")
 start.record()
 for i, data in enumerate(dataloader):
-    if i == 10:
+    if i == 100:
         break
     video = data[0]
     label = data[1]
@@ -190,8 +140,9 @@ for i, data in enumerate(dataloader):
 
 end.record()
 torch.cuda.synchronize()
+print("--- end timing ---")
 
-decord_gpu_time = start.elapsed_time(end)/1000 # is is in ms
-decord_gpu_time_batch = decord_gpu_time / i
-print('It took %f seconds for %d batches, or %f second per batch' %(decord_gpu_time, i, decord_gpu_time_batch) )
-cuda_ctx.pop()
+gpu_time = start.elapsed_time(end)/1000 # is is in ms
+gpu_time_batch = gpu_time / (i* batch_size * sequence_length) # in seconds per frame
+print('It took %f seconds for %d batches of %d frames, or %f second per frame' %(gpu_time, i, sequence_length, gpu_time_batch) )
+

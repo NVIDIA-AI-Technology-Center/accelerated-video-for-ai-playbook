@@ -20,9 +20,22 @@
 # DEALINGS IN THE SOFTWARE.
 #!/bin/bash
 
+# navigate to your dataset folder
+cd /path/where/the/dataset/rar/is/located
+
+# you might need sudo apt install unrar
+unrar x -opUCF-101 UCF101.rar
+
+# create the output folder
+mkdir -p UCF-101/UCF-101_proc
 # create subfolders in the output folder
-find . -type d -mindepth 1 -maxdepth 1 -exec bash -c 'input="{}"; output="../output/${input:2}"; mkdir -p "$output"' \;
+find UCF-101 -mindepth 2 -maxdepth 2 -type d ! -path 'UCF-101/UCF-101_proc*' -exec bash -c 'input="{}"; output="UCF-101/UCF-101_proc/${input:16}"; mkdir -p "$output"' \;
 
 # preprocess the videos
-find . -name "*.avi" -mindepth 1 -maxdepth 2 -exec bash -c 'input="{}"; output="../output/${input:2:-3}mp4"; ffmpeg -i "$input" -vf scale=320:240 -c:v libx264 -preset slow -crf 22 -an -r 30 "$output"' \;
-
+# added multiprocessing to speed up
+find UCF-101 -mindepth 2 -maxdepth 3 -name "*.avi" ! -path 'UCF-101/UCF-101_proc*' \
+  -print0 | xargs -0 -P 16 -I {} bash -c '
+    input={};
+    output="UCF-101/UCF-101_proc/${input:16:-3}mp4";
+    ffmpeg -hide_banner -loglevel error -i "$input" -vf scale=320:240 -c:v libx264 -preset slow -crf 22 -an -r 30 "$output"
+'
